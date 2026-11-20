@@ -1,0 +1,203 @@
+#define _DEFAULT_SOURCE
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+#define ALIGN 16
+#define ALIGN_UP(n) (((n)+ALIGN - 1 )/ALIGN*ALIGN)
+
+typedef enum{ FIRST_FIT, BEST_FIT, WORST_FIT} Policy;
+
+typedef struct Block{
+	int size;
+	int requested;
+	int free;
+	struct Block *next;
+} Block;
+
+#define HDR ALIGN_UP(sizeof(Block))
+
+static Block *head = NULL;
+static Block *tail = NULL;
+static Policy policy=FIRST_FIT;
+
+static void *payload(Block *b) { return (char *)b+HDR;}
+static Block *block_of(void *p) { return (Block *)((char *)p - HDR); }
+
+static Block *find_free_block(int size){
+	Block *chosen = NULL;
+	for(Block *b = head; b!= NULL; b=b->next){
+		if(!b->free || b->size<size)
+			continue;
+		if(policy==FIRST_FIT)
+			return b;
+		if(policy == BEST_FIT && (chosen == NULL || b->size < chosen->size))
+			chosen=b;
+		if(policy == WORST_FIT && (chosen == NULL || b->size > chosen->size))
+			chosen=b;
+	}
+	return chosen;
+}
+
+static Block *request_space(int size){
+	Block *b = sbrk(HDR + size);
+	if (b == (void *)-1)
+		return NULL;
+	b->size=size;
+	b->next=NULL;
+	if(tail) tail->next=b;
+	else head=b;
+	tail=b;
+	return b;
+}
+
+static void split_block(Block *b, int size){
+	if( b->size < size + HDR + ALIGN)
+		return;
+	Block *n = (Block *)((char *)payload(b) + size);
+	n->size = b->size - size - HDR;
+	n->requested =0;
+	n->free =1;
+	n->next = b->next;
+	b->next=n;
+	b->size=size;
+	if(tail == b) tail=n;
+}
+
+static void coalesce(void){
+	for( Block *b=head; b!=NULL; b=b->next) {
+		while( b->free && b->next && b->next->free && (char *)payload(b) + b->size == (char *)b->next){
+			b->size += HDR + b->next->size;
+			b->next = b->next->next;
+			if( b->next == NULL) tail=b;
+		}
+	}
+}
+
+void *my_malloc(int size){
+	if(size <=0 || size>100000)
+		return NULL;
+	int asize = ALIGN_UP(size);
+	Block *b =find_free_block(asize);
+	if(b)
+		split_block(b,asize);
+	else {
+		b=request_space(asize);
+		if(b==NULL) return NULL;
+	}
+	b->free=0;
+	b->requested=size;
+	return payload(b);
+}
+
+void my_free(void *ptr) {
+	if(ptr == NULL)
+		return;
+	Block *b = block_of(ptr);
+	b->free=1;
+	b->requested=0;
+	coalesce();
+}
+
+void *my_realloc(void *ptr, int size) {
+	if(ptr == NULL)
+		return my_malloc(size);
+	if(size ==0){
+		my_free(ptr);
+		return NULL;
+	}
+	Block *b = block_of(ptr);
+	if(size<= b->size) {
+		b->requested = size;
+		return ptr;
+	}
+	void *new_ptr = my_malloc(size);
+	if(new_ptr == NULL)
+		return NULL;
+	memcpy(new_ptr, ptr, b->requested);
+	my_free(ptr);
+	return new_ptr;
+}
+
+void print_heap( const char *title) {
+	printf("\n%s\n",title);
+	int i=0;
+	for( Block *b = head; b!=NULL; b= b->next, i++){
+		printf("  block %2d: %-4s size %4d", i, b->free ? "FREE" : "USED",  b->size);
+        	if (!b->free) printf("  (user asked for %d)", b->requested);
+     		printf("\n");
+    	}
+}
+
+void print_stats(void) {
+	int total=0, used=0, requested=0, free_bytes=0, largest=0, num_used=0, num_free=0;
+
+	for( Block *b=head; b!=NULL; b=b->next) {
+		total += HDR + b->size;
+		if(b->free) {
+			num_free++;
+			free_bytes += b->size;
+			if( b->size > largest ) largest=b->size;
+		} else {
+			num_used++;
+			used += b->size;
+			requested += b->requested;
+		}
+	}
+
+	double external = free_bytes ? 100.0*(1.0-(double)largest/ free_bytes) : 0.0;
+	double internal = used ? 100.0*(double)(used - requested)/used : 0.0;
+
+	printf("\n--- Statistics ---\n");
+	printf(" heap size		: %d bytes\n", total);
+	printf(" used blocks		: %d (%d bytes)\n", num_used, used);
+	printf(" free blocks		: %d (%d bytes)\n", num_free, free_bytes);
+	printf(" largest free block	: %d bytes\n", largest);
+	printf(" external fragmentation	: %.1f%%\n", external);
+	printf(" internal fragmentation	: %.1f%% (%d bytes wasted)\n", internal, used-requested);
+}
+
+int main( int argc, char *argv[]){
+	const char *name = "first-fit";
+	if(argc > 1 && strcmp(argv[1], "best") ==0) { policy = BEST_FIT; name="best-fit";}
+	if(argc>1 && strcmp(argv[1],"worst")==0) { policy=WORST_FIT; name="worst-fit";}
+	printf("Placement Policy : %s\n",name);
+	int sizes[10]={100,500,200,300,600,50,800,150,400,250};
+	char *p[10];
+	for( int i=0; i<10; i++) {
+		p[i] = my_malloc(sizes[i]);
+		memset(p[i],'A'+i,sizes[i]);
+	}
+	print_heap("After allocating 10 blocks:");
+
+	for( int i=0; i<10; i+=2)
+		my_free(p[i]);
+	print_heap("After freeing blocks 0, 2, 4, 6, 8 : ");
+
+	int requests[5]={120, 350, 220, 90, 450};
+	char *q[5];
+	for (int i=0; i<5; i++)
+		q[i]= my_malloc(requests[i]);
+	print_heap("After 5 new requests (120, 350, 220, 90, 450 bytes): ");
+	print_stats();
+
+	memset(q[0],'Z',120);
+	q[0]=my_realloc(q[0],1000);
+	int ok=1;
+	for( int i=0;i<120;i++)
+		if (q[0][i] != 'Z') ok=0;
+	printf("\nrealloc from 120 to 1000 bytes kep the data: %s\n", ok? "yes" : "no");
+
+	ok=1;
+	for( int i=1;i<10;i+=2){
+		for( int k=0; k<sizes[i];k++)
+			if( p[i][k] != 'A' +i) ok=0;
+		}
+	printf("blocks that were never freed are intact : %s\n", ok ? "yes" : "no");
+
+	for( int i=1;i<10;i+=2) my_free(p[i]);
+	for( int i=0;i<5;i++) my_free(q[i]);
+	print_heap("After freeing everything (coalescing):");
+	print_stats();
+	return 0;
+}
